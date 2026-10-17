@@ -266,15 +266,19 @@ def build_digest_message(title, date_text, grid):
 def send_telegram(text):
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("Не задано BOT_TOKEN або CHANNEL_ID")
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": True},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for attempt, payload in enumerate((
+            {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML",
+             "disable_web_page_preview": True},
+            {"chat_id": CHANNEL_ID, "text": re.sub(r"</?b>", "", text),
+             "disable_web_page_preview": True})):
+        r = requests.post(url, json=payload, timeout=30)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 400 and attempt == 0:
+            continue  # повтор без HTML-розмітки
+        raise RuntimeError(f"Telegram {r.status_code}: {r.text[:300]}")
+    raise RuntimeError("Telegram: не вдалося надіслати повідомлення")
 
 def grid_signature(date_text, grid):
     payload = json.dumps({"date": date_text, "grid": grid}, sort_keys=True, ensure_ascii=False)
