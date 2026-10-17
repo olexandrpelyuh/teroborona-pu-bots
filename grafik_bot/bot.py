@@ -97,44 +97,62 @@ def fetch_grid(url=None):
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
 
+    # Дата: лише короткий заголовок (<120 символів), не контейнер з усім текстом сторінки
     date_text = ""
-    for el in soup.find_all(["h1", "h2", "h3", "h4", "div", "p", "span", "b"]):
-        if "Графік відключень на" in el.get_text():
-            date_text = el.get_text(" ", strip=True)
+    for el in soup.find_all(["h1", "h2", "h3", "h4", "h5", "p", "span", "b"]):
+        t = el.get_text(" ", strip=True)
+        if "Графік відключень на" in t and len(t) < 120:
+            date_text = t
             break
+    if not date_text:
+        m = re.search(r"Графік відключень на[:\s]*([^\n<]{0,60})", soup.get_text(" "))
+        if m:
+            date_text = "Графік відключень на: " + m.group(1).strip()[:60]
 
-    table = None
+    # Розібрати ВСІ таблиці-претенденти й обрати найкращу:
+    # пріоритет — таблиця з найбільшою кількістю заповнених (кольорових) комірок,
+    # це відсікає «Попередній графік» (вже неактивний) та адресні таблиці.
+    color_map = load_color_map()
+
+    def parse_table(t):
+        grid, unknown, current_queue = {}, {}, ""
+        for tr in t.find_all("tr"):
+            cells = tr.find_all(["th", "td"])
+            if not cells:
+                continue
+            first = cells[0].get_text(" ", strip=True)
+            low = first.lower()
+            if "черга" in low and "підчерга" not in low:
+                current_queue = first.replace("черга", "").strip()
+                continue
+            if "підчерга" in low:
+                sub = first.replace("підчерга", "").strip()
+                label = f"{current_queue}-{sub}" if current_queue and "-" not in sub else sub
+                statuses = []
+                for td in cells[1:][: len(SLOTS)]:
+                    st, raw = cell_status(td, color_map)
+                    statuses.append(st)
+                    if st == "unknown" and raw is not None:
+                        unknown[raw] = unknown.get(raw, 0) + 1
+                grid[label] = statuses
+        return grid, unknown
+
+    best = None  # (nonempty, n_queues, grid, unknown)
     for t in soup.find_all("table"):
         header_cells = [c.get_text(strip=True) for c in t.find_all(["th", "td"])[:60]]
         joined = " ".join(header_cells)
-        if "00:00" in joined and "23:30" in joined:
-            table = t
-            break
-    if table is None:
+        if "00:00" not in joined or "23:30" not in joined:
+            continue
+        grid, unknown = parse_table(t)
+        if not grid:
+            continue
+        nonempty = sum(1 for sts in grid.values() for s in sts if s != "empty")
+        score = (nonempty, len(grid))
+        if best is None or score > best[:2]:
+            best = (nonempty, len(grid), grid, unknown)
+    if best is None:
         raise RuntimeError("Не знайшов таблицю графіка на сторінці (можливо, змінилася верстка)")
-
-    color_map = load_color_map()
-    grid = {}
-    unknown = {}
-    current_queue = ""
-    for tr in table.find_all("tr"):
-        cells = tr.find_all(["th", "td"])
-        if not cells:
-            continue
-        first = cells[0].get_text(" ", strip=True)
-        if "черга" in first.lower() and "підчерга" not in first.lower():
-            current_queue = first.replace("черга", "").strip()
-            continue
-        if "підчерга" in first.lower():
-            sub = first.replace("підчерга", "").strip()
-            label = f"{current_queue}-{sub}" if current_queue and "-" not in sub else sub
-            statuses = []
-            for td in cells[1:][: len(SLOTS)]:
-                st, raw = cell_status(td, color_map)
-                statuses.append(st)
-                if st == "unknown" and raw is not None:
-                    unknown[raw] = unknown.get(raw, 0) + 1
-            grid[label] = statuses
+    _, _, grid, unknown = best
     return date_text, grid, unknown
 
 
