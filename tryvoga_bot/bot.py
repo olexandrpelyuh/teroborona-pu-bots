@@ -40,11 +40,21 @@ STATE_FILE = Path(__file__).parent / "state.json"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 
-WATCH_LAT = float(os.environ.get("WATCH_LAT", "47.82"))   # Південноукраїнськ
-WATCH_LON = float(os.environ.get("WATCH_LON", "31.18"))
-WATCH_NAME = os.environ.get("WATCH_NAME", "Південноукраїнська")
-WARN_ETA = int(os.environ.get("WARN_ETA_MIN", "60"))
-CRITICAL_ETA = int(os.environ.get("CRITICAL_ETA_MIN", "15"))
+def _env_float(name, default):
+    v = (os.environ.get(name) or "").strip()
+    return float(v) if v else default
+
+
+def _env_int(name, default):
+    v = (os.environ.get(name) or "").strip()
+    return int(v) if v else default
+
+
+WATCH_LAT = _env_float("WATCH_LAT", 47.82)   # Південноукраїнськ
+WATCH_LON = _env_float("WATCH_LON", 31.18)
+WATCH_NAME = (os.environ.get("WATCH_NAME") or "").strip() or "Південноукраїнська"
+WARN_ETA = _env_int("WARN_ETA_MIN", 60)
+CRITICAL_ETA = _env_int("CRITICAL_ETA_MIN", 15)
 
 ALERTS_TOKEN = os.environ.get("ALERTS_TOKEN", "")
 OBLAST_UID = os.environ.get("OBLAST_UID", "")
