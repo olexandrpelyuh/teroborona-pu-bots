@@ -78,7 +78,28 @@ def cell_status(td, color_map):
                     val = "img:" + (m.group(1).split("/")[-1] if m else val)
                 key = val
                 break
-    elif classes:
+    if key is None:
+        # колір може бути у вкладеному елементі (div/span зі style або bgcolor)
+        for inner in td.find_all(True):
+            if inner.name == "img":
+                continue
+            bg = (inner.get("bgcolor") or "").strip().lower()
+            st = (inner.get("style") or "").lower()
+            if bg:
+                key = bg
+                break
+            if "background" in st:
+                for part in st.split(";"):
+                    if "background" in part and ":" in part:
+                        val = part.split(":", 1)[1].strip()
+                        if "url(" in val:
+                            mm = re.search("url\\(([^)]*)\\)", val)
+                            val = "img:" + (mm.group(1).strip("'\"").split("/")[-1] if mm else val)
+                        key = val
+                        break
+            if key is not None:
+                break
+    if key is None and classes:
         key = classes
     if key is None:
         return "empty", None
@@ -358,6 +379,33 @@ def main():
                 print(f"  {k!r}: {v} комірок")
         else:
             print("\nНевідомих кольорів немає — мапа кольорів повна.")
+        # Дамп структури: мітки рядків і зразки сирих комірок для діагностики
+        print("\n--- ДАМП СТРУКТУРИ (для діагностики) ---")
+        try:
+            resp = requests.get(url or URL, headers={"User-Agent": "grafik-bot/1.0"}, timeout=30)
+            resp.encoding = resp.apparent_encoding or "utf-8"
+            soup2 = BeautifulSoup(resp.text, "html.parser")
+            for ti, t in enumerate(soup2.find_all("table")):
+                hc = [c.get_text(strip=True) for c in t.find_all(["th", "td"])][:10]
+                if "00:00" not in " ".join(hc):
+                    continue
+                print(f"Таблиця #{ti}: рядків {len(t.find_all('tr'))}")
+                for tr in t.find_all("tr")[:14]:
+                    cells = tr.find_all(["th", "td"])
+                    if cells:
+                        print(f"  row: {cells[0].get_text(' ', strip=True)[:40]!r} | комірок: {len(cells)}")
+                shown = 0
+                for tr in t.find_all("tr"):
+                    for td in tr.find_all("td"):
+                        s = str(td).replace("\n", " ")
+                        if "color" in s or "bg" in s.lower() or td.find("img"):
+                            print(f"  sample td: {s[:180]!r}")
+                            shown += 1
+                            break
+                    if shown >= 4:
+                        break
+        except Exception as e:
+            print("Дамп не вдався:", e)
         return
 
     if args.digest:
