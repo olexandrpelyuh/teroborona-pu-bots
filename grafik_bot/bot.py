@@ -382,7 +382,7 @@ def main():
         # Дамп структури: мітки рядків і зразки сирих комірок для діагностики
         print("\n--- ДАМП СТРУКТУРИ (для діагностики) ---")
         try:
-            resp = requests.get(url or URL, headers={"User-Agent": "grafik-bot/1.0"}, timeout=30)
+            resp = requests.get(url or URL, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}, timeout=30)
             resp.encoding = resp.apparent_encoding or "utf-8"
             soup2 = BeautifulSoup(resp.text, "html.parser")
             for ti, t in enumerate(soup2.find_all("table")):
@@ -404,6 +404,18 @@ def main():
                             break
                     if shown >= 4:
                         break
+            # Шукаємо дані графіка у <script> та <style> (кольори малює JS)
+            KEYWORDS = ("cell", "graf", "color", "off", "schedule", "queue", "підчерга", "черга")
+            for si, sc in enumerate(soup2.find_all("script")):
+                txt = sc.string or sc.get_text() or ""
+                if txt and any(k in txt.lower() for k in KEYWORDS):
+                    print(f"\n--- script #{si} ({len(txt)} символів) ---")
+                    print(txt[:1500].replace("\n", " ")[:1500])
+            for si, st in enumerate(soup2.find_all("style")):
+                txt = st.get_text() or ""
+                if txt:
+                    print(f"\n--- style #{si} ({len(txt)} символів) ---")
+                    print(txt[:800].replace("\n", " ")[:800])
         except Exception as e:
             print("Дамп не вдався:", e)
         return
