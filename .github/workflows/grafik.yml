@@ -1,1 +1,69 @@
-`.github/workflows/grafik.yml`
+name: grafik-bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # перевірка змін — кожні 10 хвилин
+    - cron: "0 4 * * *"      # ☀️ дайджест «на сьогодні»  = 07:00 за Києвом (UTC+3)
+    - cron: "0 17 * * *"     # 🌙 дайджест «на завтра»    = 20:00 за Києвом (UTC+3)
+  workflow_dispatch:         # ручний запуск з вкладки Actions
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    if: github.event.schedule == '*/10 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          WATCH_QUEUES: ${{ secrets.WATCH_QUEUES }}
+        run: python grafik_bot/bot.py
+      - name: Commit state
+        run: |
+          git config user.name "grafik-bot"
+          git config user.email "bot@example.com"
+          git add grafik_bot/state.json
+          git diff --cached --quiet || git commit -m "state: update schedule snapshot"
+          git push
+
+  digest-morning:
+    if: github.event.schedule == '0 4 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4
+      - name: Morning digest
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          WATCH_QUEUES: ${{ secrets.WATCH_QUEUES }}
+        run: python bot.py --digest "☀️ <b>ГРАФІК НА СЬОГОДНІ</b>"
+
+  digest-evening:
+    if: github.event.schedule == '0 17 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4
+      - name: Evening digest
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          WATCH_QUEUES: ${{ secrets.WATCH_QUEUES }}
+          # Якщо графік «на завтра» — окрема сторінка, задай її тут:
+          DIGEST_URL: ${{ secrets.DIGEST_URL }}
+        run: python bot.py --digest "🌙 <b>ГРАФІК НА ЗАВТРА</b>"
