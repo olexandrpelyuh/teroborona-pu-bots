@@ -1,1 +1,38 @@
-`.github/workflows/tryvoga.yml`
+name: tryvoga-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # перевірка кожні 5 хв (мінімум для GitHub Actions)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          WATCH_LAT: ${{ secrets.WATCH_LAT }}
+          WATCH_LON: ${{ secrets.WATCH_LON }}
+          WATCH_NAME: ${{ secrets.WATCH_NAME }}
+          WARN_ETA_MIN: ${{ secrets.WARN_ETA_MIN }}
+          CRITICAL_ETA_MIN: ${{ secrets.CRITICAL_ETA_MIN }}
+          ALERTS_TOKEN: ${{ secrets.ALERTS_TOKEN }}
+          OBLAST_UID: ${{ secrets.OBLAST_UID }}
+        run: python tryvoga_bot/bot.py
+      - name: Commit state
+        run: |
+          git config user.name "tryvoga-bot"
+          git config user.email "bot@example.com"
+          git add tryvoga_bot/state.json
+          git diff --cached --quiet || git commit -m "state: update threats snapshot"
+          git push
