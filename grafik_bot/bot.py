@@ -263,22 +263,47 @@ def build_digest_message(title, date_text, grid):
     return "\n".join(lines).rstrip()
 
 
+def _utf16_len(s):
+    return len(s.encode("utf-16-le")) // 2  # Telegram рахує ліміт у UTF-16 одиницях
+
+
+def _split_text(text, limit=3800):
+    """Розбити довге повідомлення на частини по межах рядків (ліміт UTF-16)."""
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        add = _utf16_len(cur) + _utf16_len(line) + 1
+        if add > limit and cur:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts or [text]
+
+
 def send_telegram(text):
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("Не задано BOT_TOKEN або CHANNEL_ID")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    for attempt, payload in enumerate((
-            {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML",
-             "disable_web_page_preview": True},
-            {"chat_id": CHANNEL_ID, "text": re.sub(r"</?b>", "", text),
-             "disable_web_page_preview": True})):
-        r = requests.post(url, json=payload, timeout=30)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code == 400 and attempt == 0:
-            continue  # повтор без HTML-розмітки
-        raise RuntimeError(f"Telegram {r.status_code}: {r.text[:300]}")
-    raise RuntimeError("Telegram: не вдалося надіслати повідомлення")
+    result = None
+    for part in _split_text(text):
+        for attempt, payload in enumerate((
+                {"chat_id": CHANNEL_ID, "text": part, "parse_mode": "HTML",
+                 "disable_web_page_preview": True},
+                {"chat_id": CHANNEL_ID, "text": re.sub(r"</?b>", "", part),
+                 "disable_web_page_preview": True})):
+            r = requests.post(url, json=payload, timeout=30)
+            if r.status_code == 200:
+                result = r.json()
+                break
+            if r.status_code == 400 and attempt == 0:
+                continue  # повтор без HTML-розмітки
+            raise RuntimeError(f"Telegram {r.status_code}: {r.text[:300]}")
+        else:
+            raise RuntimeError("Telegram: не вдалося надіслати повідомлення")
+        time.sleep(0.5)
+    return result
 
 def grid_signature(date_text, grid):
     payload = json.dumps({"date": date_text, "grid": grid}, sort_keys=True, ensure_ascii=False)
