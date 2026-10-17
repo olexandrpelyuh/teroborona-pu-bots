@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -343,6 +344,7 @@ def main():
 
     if args.digest:
         msg = build_digest_message(args.digest, date_text, grid)
+        print(f"Діагностика: підчерг={len(grid)}, довжина={len(msg)}, дата='{date_text}'")
         print(send_telegram(msg))
         return
 
