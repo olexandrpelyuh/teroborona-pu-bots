@@ -416,6 +416,35 @@ def main():
                 if txt:
                     print(f"\n--- style #{si} ({len(txt)} символів) ---")
                     print(txt[:800].replace("\n", " ")[:800])
+            # Парсимо records (вбудований JSON розкладу) — головне джерело даних
+            big = ""
+            for sc in soup2.find_all("script"):
+                t = sc.string or sc.get_text() or ""
+                if "records" in t and len(t) > len(big):
+                    big = t
+            if big:
+                m = re.search(r"records\s*=\s*(\[.*?\])\s*;", big, re.S)
+                if m:
+                    try:
+                        recs = json.loads(m.group(1))
+                        print(f"\n--- RECORDS: знайдено {len(recs)} записів ---")
+                        from collections import Counter
+                        for r in recs:
+                            d = r.get("data", [])
+                            c = dict(Counter(d))
+                            print(f"  date={r.get('date')} saved_at={r.get('saved_at')} "
+                                  f"cells={len(d)} values={c}")
+                    except Exception as e:
+                        print("records parse fail:", e)
+                # Які іконки/класи відповідають значенням
+                seen = set()
+                for mm in re.finditer(r'["\']([^"\']+\.(?:png|gif|jpg|svg))["\']', big):
+                    s = mm.group(1)
+                    if s not in seen:
+                        seen.add(s)
+                        print("IMG:", s)
+                for mm in re.finditer(r'(case\s+[\'"]\d|val\w*\s*[:=]\s*[\'"][^\'"]+|addClass\([^)]*\))', big):
+                    print("CLS:", mm.group(0)[:130])
         except Exception as e:
             print("Дамп не вдався:", e)
         return
