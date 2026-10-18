@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Бот моніторингу графіків відключень ДПЕМ «Атомсервіс» (info.dpem.mk.ua).
+Бот графіків відключень ДПЕМ «Атомсервіс» (v3 — парсинг records).
+
+Джерело: на сторінці info.dpem.mk.ua/off_graf.html у <script> вбудовано
+масив records = [{date, saved_at, data[576]}], де data — 12 черг × 48 слотів
+по 30 хв, значення: 0=світло, 1=перемикання, 2=відключення, 3=перемикання,
+4=можливе відключлення.
 
 Режими:
-  python bot.py                      # перевірка змін (для cron / GitHub Actions)
-  python bot.py --digest "☀️ Графік на сьогодні"   # дайджест (завжди надсилає)
-  python bot.py --learn              # показати кольори комірок (налаштування color_map.json)
-  python bot.py --test               # тестове повідомлення в канал
+  python bot.py                      # перевірка змін (кожні 10 хв)
+  python bot.py --digest "☀️ <b>ГРАФІК НА СЬОГОДНІ</b>"          # ранковий дайджест
+  python bot.py --digest "🌙 <b>ГРАФІК НА ЗАВТРА</b>" --tomorrow  # вечірній дайджест
+  python bot.py --learn              # діагностика: що є у records
+  python bot.py --test               # тестове повідомлення
 
-Змінні середовища:
-  BOT_TOKEN, CHANNEL_ID — обов'язкові
-  WATCH_QUEUES          — напр. "2-І,2-ІІ" (лише ці підчерги); порожньо = всі
-  GRAFIK_URL            — сторінка графіка (за замовчуванням — сьогоднішня)
-  DIGEST_URL            — сторінка для дайджеста "на завтра" (якщо відрізняється)
+Змінні середовища: BOT_TOKEN, CHANNEL_ID (обов'язкові), WATCH_QUEUES (опційно).
 """
 
 import argparse
@@ -23,162 +25,121 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
 
 URL = os.environ.get("GRAFIK_URL", "https://info.dpem.mk.ua/off_graf.html")
 STATE_FILE = Path(__file__).parent / "state.json"
-COLOR_MAP_FILE = Path(__file__).parent / "color_map.json"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "")  # @nazva_kanalu або -100xxxxxxxxxx
-
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 WATCH_QUEUES = os.environ.get("WATCH_QUEUES", "")
 
-SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]  # 48 слотів по 30 хв
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-DEFAULT_COLOR_MAP = {
-    # "red":       "off",
-    # "#ff0000":   "off",
-    # "img:blink.gif": "off",
-    # "yellow":    "switch",
-    # "green":     "on",
-}
-
-EMOJI = {"on": "🟩", "off": "🟥", "possible": "🟧", "switch": "🟨", "empty": "⬜", "unknown": "⬛"}
+SLOTS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
+QUEUE_LABELS = [f"{q}-{r}" for q in range(1, 7) for r in ("І", "ІІ")]
+VALUE_MAP = {"0": "on", "1": "switch", "2": "off", "3": "switch", "4": "possible"}
+EMOJI = {"on": "🟩", "off": "🟥", "possible": "🟧", "switch": "🟨", "unknown": "⬛"}
 
 
-def load_color_map():
-    mapping = dict(DEFAULT_COLOR_MAP)
-    if COLOR_MAP_FILE.exists():
-        mapping.update(json.loads(COLOR_MAP_FILE.read_text(encoding="utf-8")))
-    return mapping
+def _utf16_len(s):
+    return len(s.encode("utf-16-le")) // 2
 
 
-def cell_status(td, color_map):
-    """Статус комірки за <img> / bgcolor / style / class."""
-    key = None
-    bgcolor = (td.get("bgcolor") or "").strip().lower()
-    style = (td.get("style") or "").lower()
-    classes = " ".join(td.get("class") or [])
-    img = td.find("img")
-    if img is not None:
-        src = (img.get("src") or img.get("data-src") or "").strip()
-        key = "img:" + src.split("/")[-1] if src else "img"
-    elif bgcolor:
-        key = bgcolor
-    elif "background" in style:
-        for part in style.split(";"):
-            if "background" in part and ":" in part:
-                val = part.split(":", 1)[1].strip()
-                if "url(" in val:
-                    m = re.search(r"url\(['\"]?(.*?)['\"]?\)", val)
-                    val = "img:" + (m.group(1).split("/")[-1] if m else val)
-                key = val
-                break
-    if key is None:
-        # колір може бути у вкладеному елементі (div/span зі style або bgcolor)
-        for inner in td.find_all(True):
-            if inner.name == "img":
-                continue
-            bg = (inner.get("bgcolor") or "").strip().lower()
-            st = (inner.get("style") or "").lower()
-            if bg:
-                key = bg
-                break
-            if "background" in st:
-                for part in st.split(";"):
-                    if "background" in part and ":" in part:
-                        val = part.split(":", 1)[1].strip()
-                        if "url(" in val:
-                            mm = re.search("url\\(([^)]*)\\)", val)
-                            val = "img:" + (mm.group(1).strip("'\"").split("/")[-1] if mm else val)
-                        key = val
-                        break
-            if key is not None:
-                break
-    if key is None and classes:
-        key = classes
-    if key is None:
-        return "empty", None
-    key_l = key.lower()
-    for k, v in color_map.items():
-        if k.lower() == key_l:
-            return v, key
-    return "unknown", key
+def _split_text(text, limit=3800):
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if _utf16_len(cur) + _utf16_len(line) + 1 > limit and cur:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts or [text]
 
 
-def fetch_grid(url=None):
-    """Завантажити сторінку й розпарсити таблицю графіка."""
-    url = url or URL
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (grafik-bot/1.0)"}, timeout=30)
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_state(st):
+    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def fetch_records(url=None):
+    """Завантажити сторінку й витягнути масив records."""
+    resp = requests.get(url or URL, headers={"User-Agent": UA}, timeout=30)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
+    big = ""
+    for sc in soup.find_all("script"):
+        t = sc.string or sc.get_text() or ""
+        if "records" in t and len(t) > len(big):
+            big = t
+    if not big:
+        raise RuntimeError("Не знайшов records на сторінці (верстка змінилася?)")
+    matches = re.findall(r"records\s*=\s*(\[.*?\])\s*;", big, re.S)
+    if not matches:
+        raise RuntimeError("Не вдалося розпарсити records")
+    recs = json.loads(max(matches, key=len))
+    recs = [r for r in recs if isinstance(r, dict) and r.get("date") and r.get("data")]
+    recs.sort(key=lambda r: r["date"], reverse=True)
+    if not recs:
+        raise RuntimeError("records порожній")
+    return recs
 
-    # Дата: лише короткий заголовок (<120 символів), не контейнер з усім текстом сторінки
-    date_text = ""
-    for el in soup.find_all(["h1", "h2", "h3", "h4", "h5", "p", "span", "b"]):
-        t = el.get_text(" ", strip=True)
-        if "Графік відключень на" in t and len(t) < 120:
-            date_text = t
-            break
-    if not date_text:
-        m = re.search(r"Графік відключень на[:\s]*([^\n<]{0,60})", soup.get_text(" "))
-        if m:
-            date_text = "Графік відключень на: " + m.group(1).strip()[:60]
 
-    # Розібрати ВСІ таблиці-претенденти й обрати найкращу:
-    # пріоритет — таблиця з найбільшою кількістю заповнених (кольорових) комірок,
-    # це відсікає «Попередній графік» (вже неактивний) та адресні таблиці.
-    color_map = load_color_map()
+def kyiv_today():
+    return datetime.now(ZoneInfo("Europe/Kyiv")).date()
 
-    def parse_table(t):
-        grid, unknown, current_queue = {}, {}, ""
-        for tr in t.find_all("tr"):
-            cells = tr.find_all(["th", "td"])
-            if not cells:
-                continue
-            first = cells[0].get_text(" ", strip=True)
-            low = first.lower()
-            if "черга" in low and "підчерга" not in low:
-                current_queue = first.replace("черга", "").strip()
-                continue
-            if "підчерга" in low:
-                sub = first.replace("підчерга", "").strip()
-                label = f"{current_queue}-{sub}" if current_queue and "-" not in sub else sub
-                statuses = []
-                for td in cells[1:][: len(SLOTS)]:
-                    st, raw = cell_status(td, color_map)
-                    statuses.append(st)
-                    if st == "unknown" and raw is not None:
-                        unknown[raw] = unknown.get(raw, 0) + 1
-                grid[label] = statuses
-        return grid, unknown
 
-    best = None  # (nonempty, n_queues, grid, unknown)
-    for t in soup.find_all("table"):
-        header_cells = [c.get_text(strip=True) for c in t.find_all(["th", "td"])[:60]]
-        joined = " ".join(header_cells)
-        if "00:00" not in joined or "23:30" not in joined:
-            continue
-        grid, unknown = parse_table(t)
-        if not grid:
-            continue
-        nonempty = sum(1 for sts in grid.values() for s in sts if s != "empty")
-        score = (nonempty, len(grid))
-        if best is None or score > best[:2]:
-            best = (nonempty, len(grid), grid, unknown)
-    if best is None:
-        raise RuntimeError("Не знайшов таблицю графіка на сторінці (можливо, змінилася верстка)")
-    _, _, grid, unknown = best
-    return date_text, grid, unknown
+def record_for(records, day):
+    """day: 'today' | 'tomorrow' | 'latest'. Повертає (record, note)."""
+    today = kyiv_today()
+    if day == "latest":
+        return records[0], ""
+    target = today if day == "today" else today + timedelta(days=1)
+    tstr = target.isoformat()
+    for r in records:
+        if r["date"] == tstr:
+            return r, ""
+    if day == "today":
+        # сьогоднішнього немає → беремо найсвіжіший не пізніше сьогодні
+        for r in records:
+            if r["date"] <= tstr:
+                return r, f"⚠️ Графіка на сьогодні ({tstr}) ще немає — показую останній доступний: {r['date']}"
+        return records[0], ""
+    return None, f"⚠️ Дані на {tstr} ще не надходили. Очікуємо публікацію від ДПЕМ."
+
+
+def build_grid(record):
+    data = [str(v) for v in record["data"]]
+    if len(data) < 576:
+        raise RuntimeError(f"Несподівана довжина data: {len(data)}")
+    grid = {}
+    for i, label in enumerate(QUEUE_LABELS):
+        grid[label] = [VALUE_MAP.get(v, "unknown") for v in data[i * 48:(i + 1) * 48]]
+    return grid
+
+
+def date_text(record):
+    txt = f"Графік відключень на: {record['date']}"
+    if record.get("saved_at"):
+        txt += f" (оновлено {record['saved_at']})"
+    return txt
 
 
 def windows(statuses, target=("off", "possible")):
-    """Склеїти послідовні слоти зі статусом із target: «HH:MM–HH:MM»."""
     result, start = [], None
     for i, st in enumerate(list(statuses) + ["end"]):
         if st in target and start is None:
@@ -190,34 +151,20 @@ def windows(statuses, target=("off", "possible")):
 
 
 def timeline(statuses):
-    """Візуальна стрічка доби: 24 блоки (по 1 год), потім деталізація 2×24."""
-    day1 = "".join(EMOJI.get(st, "⬛") for st in statuses[:24])
-    day2 = "".join(EMOJI.get(st, "⬛") for st in statuses[24:])
-    return f"🌙 00–12  {day1}\n☀️ 12–24  {day2}"
-
-
-def watched_labels(grid):
-    watch = [w.strip() for w in WATCH_QUEUES.split(",") if w.strip()]
-    labels = sorted(grid, key=lambda x: [int(p) if p.isdigit() else p for p in
-                 x.replace("ІІ", "2").replace("І", "1").split("-")])
-    return [l for l in labels if not watch or l in watch]
+    return (f"🌙 00–12  {''.join(EMOJI.get(s, '⬛') for s in statuses[:24])}\n"
+            f"☀️ 12–24  {''.join(EMOJI.get(s, '⬛') for s in statuses[24:])}")
 
 
 def off_hours(statuses):
-    """Скільки годин без світла за добу (off + possible)."""
     n = sum(1 for st in statuses if st in ("off", "possible"))
     h, m = divmod(n * 30, 60)
     return f"{h} год" + (f" {m} хв" if m else "")
 
 
 def next_off_line(statuses, now=None):
-    """Стан зараз + наступне відключення: найкорисніший рядок для людини."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
     now = now or datetime.now(ZoneInfo("Europe/Kyiv"))
     idx = now.hour * 2 + (1 if now.minute >= 30 else 0)
     cur = statuses[idx] if idx < len(statuses) else "empty"
-    # кінець поточного вікна
     if cur in ("off", "possible"):
         end = idx
         while end < len(statuses) and statuses[end] in ("off", "possible"):
@@ -226,7 +173,6 @@ def next_off_line(statuses, now=None):
             eh, em = divmod(end * 30, 60)
             return f"⚡ <b>Зараз без світла</b> — очікується до {eh:02d}:{em:02d}"
         return "⚡ <b>Зараз без світла</b>"
-    # наступне вікно
     nxt = None
     for i in range(idx, len(statuses)):
         if statuses[i] in ("off", "possible"):
@@ -249,77 +195,54 @@ def next_off_line(statuses, now=None):
     return f"⏰ Наступне: <b>{hh:02d}:{mm:02d}–{eh:02d}:{em:02d}</b> ({when})"
 
 
-def queue_block(label, statuses, now=None):
-    """Красивий блок однієї черги."""
+def watched_labels(grid):
+    watch = [w.strip() for w in WATCH_QUEUES.split(",") if w.strip()]
+    labels = [l for l in QUEUE_LABELS if l in grid]
+    return [l for l in labels if not watch or l in watch]
+
+
+def queue_block(label, statuses, with_next=True):
     wins = windows(statuses)
     lines = [f"<b>Черга {label}</b>", timeline(statuses)]
     if wins:
         lines.append(f"🔴 Відключення: {', '.join(wins)} · разом {off_hours(statuses)}")
     else:
         lines.append("🟢 Без відключень ✅")
-    if now is not None:
-        lines.append(next_off_line(statuses, now))
+    if with_next:
+        lines.append(next_off_line(statuses))
     return lines
 
 
-def build_alert_message(date_text, grid):
-    """Повідомлення про ЗМІНУ графіка."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    now = datetime.now(ZoneInfo("Europe/Kyiv"))
-    lines = ["⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ ЗМІНЕНО!</b>", ""]
-    if date_text:
-        lines.append(f"📅 {date_text}")
-    lines.append("")
+def build_alert_message(record, grid):
+    lines = ["⚡ <b>ГРАФІК ВІДКЛЮЧЕНЬ ЗМІНЕНО!</b>", "", date_text(record), ""]
     labels = watched_labels(grid)
-    labels.sort(key=lambda l: 0 if windows(grid[l]) else 1)  # з відключеннями — першими
-    any_off = False
+    labels.sort(key=lambda l: 0 if windows(grid[l]) else 1)
+    any_off = any(windows(grid[l]) for l in labels)
     for label in labels:
-        if windows(grid[label]):
-            any_off = True
-        lines += queue_block(label, grid[label], now)
+        lines += queue_block(label, grid[label])
         lines.append("")
     if not any_off:
         lines.append("✅ Відключень за графіком немає")
     return "\n".join(lines).rstrip()
 
 
-def build_digest_message(title, date_text, grid):
-    """Щоденний дайджест (завжди надсилається)."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    now = datetime.now(ZoneInfo("Europe/Kyiv"))
+def build_digest_message(title, record, grid, note=""):
     lines = [title, ""]
-    if date_text:
-        lines.append(f"📅 {date_text}")
+    if record is None:
+        lines.append(note or "⚠️ Дані ще не надходили.")
+        return "\n".join(lines)
+    lines.append(date_text(record))
+    if note:
+        lines.append(note)
     lines.append("")
     labels = watched_labels(grid)
     labels.sort(key=lambda l: 0 if windows(grid[l]) else 1)
     for label in labels:
-        lines += queue_block(label, grid[label], now)
+        lines += queue_block(label, grid[label])
         lines.append("")
     lines.append("🟩 світло · 🟥 відключення · 🟧 можливе · 🟨 перемикання")
     lines.append("⏳ На перемикання черг — до 30 хвилин")
     return "\n".join(lines).rstrip()
-
-
-def _utf16_len(s):
-    return len(s.encode("utf-16-le")) // 2  # Telegram рахує ліміт у UTF-16 одиницях
-
-
-def _split_text(text, limit=3800):
-    """Розбити довге повідомлення на частини по межах рядків (ліміт UTF-16)."""
-    parts, cur = [], ""
-    for line in text.split("\n"):
-        add = _utf16_len(cur) + _utf16_len(line) + 1
-        if add > limit and cur:
-            parts.append(cur)
-            cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        parts.append(cur)
-    return parts or [text]
 
 
 def send_telegram(text):
@@ -338,143 +261,69 @@ def send_telegram(text):
                 result = r.json()
                 break
             if r.status_code == 400 and attempt == 0:
-                continue  # повтор без HTML-розмітки
+                continue
             raise RuntimeError(f"Telegram {r.status_code}: {r.text[:300]}")
         else:
             raise RuntimeError("Telegram: не вдалося надіслати повідомлення")
         time.sleep(0.5)
     return result
 
-def grid_signature(date_text, grid):
-    payload = json.dumps({"date": date_text, "grid": grid}, sort_keys=True, ensure_ascii=False)
+
+def signature(record):
+    payload = json.dumps({"date": record["date"], "saved_at": record.get("saved_at"),
+                          "data": record["data"]}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--learn", action="store_true", help="показати знайдені кольори комірок")
-    ap.add_argument("--test", action="store_true", help="надіслати тестове повідомлення")
-    ap.add_argument("--digest", metavar="TITLE", help="режим дайджеста: надіслати повідомлення завжди")
+    ap.add_argument("--learn", action="store_true")
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--digest", metavar="TITLE")
+    ap.add_argument("--tomorrow", action="store_true")
     args = ap.parse_args()
 
     if args.test:
         print(send_telegram("✅ Тест: бот графіків підключений і працює."))
         return
 
-    # Дайджест «на завтра» може жити на іншій сторінці (DIGEST_URL)
-    url = os.environ.get("DIGEST_URL", "") if args.digest else ""
-    date_text, grid, unknown = fetch_grid(url or None)
-    if not grid:
-        raise RuntimeError("Таблицю знайдено, але підчерги не розпізнано")
+    records = fetch_records()
 
     if args.learn:
-        print(f"URL: {url or URL}")
-        print(f"Дата графіка: {date_text}")
-        print(f"Знайдено підчерг: {len(grid)}: {', '.join(sorted(grid))}")
-        cm = load_color_map()
-        print(f"Відомі кольори (color_map.json): {cm or '— порожньо —'}")
-        if unknown:
-            print("\nНЕРОЗПІЗНАНІ кольори/стилі комірок (додай їх у color_map.json):")
-            for k, v in sorted(unknown.items(), key=lambda x: -x[1]):
-                print(f"  {k!r}: {v} комірок")
-        else:
-            print("\nНевідомих кольорів немає — мапа кольорів повна.")
-        # Дамп структури: мітки рядків і зразки сирих комірок для діагностики
-        print("\n--- ДАМП СТРУКТУРИ (для діагностики) ---")
-        try:
-            resp = requests.get(url or URL, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}, timeout=30)
-            resp.encoding = resp.apparent_encoding or "utf-8"
-            soup2 = BeautifulSoup(resp.text, "html.parser")
-            for ti, t in enumerate(soup2.find_all("table")):
-                hc = [c.get_text(strip=True) for c in t.find_all(["th", "td"])][:10]
-                if "00:00" not in " ".join(hc):
-                    continue
-                print(f"Таблиця #{ti}: рядків {len(t.find_all('tr'))}")
-                for tr in t.find_all("tr")[:14]:
-                    cells = tr.find_all(["th", "td"])
-                    if cells:
-                        print(f"  row: {cells[0].get_text(' ', strip=True)[:40]!r} | комірок: {len(cells)}")
-                shown = 0
-                for tr in t.find_all("tr"):
-                    for td in tr.find_all("td"):
-                        s = str(td).replace("\n", " ")
-                        if "color" in s or "bg" in s.lower() or td.find("img"):
-                            print(f"  sample td: {s[:180]!r}")
-                            shown += 1
-                            break
-                    if shown >= 4:
-                        break
-            # Шукаємо дані графіка у <script> та <style> (кольори малює JS)
-            KEYWORDS = ("cell", "graf", "color", "off", "schedule", "queue", "підчерга", "черга")
-            for si, sc in enumerate(soup2.find_all("script")):
-                txt = sc.string or sc.get_text() or ""
-                if txt and any(k in txt.lower() for k in KEYWORDS):
-                    print(f"\n--- script #{si} ({len(txt)} символів) ---")
-                    print(txt[:1500].replace("\n", " ")[:1500])
-            for si, st in enumerate(soup2.find_all("style")):
-                txt = st.get_text() or ""
-                if txt:
-                    print(f"\n--- style #{si} ({len(txt)} символів) ---")
-                    print(txt[:800].replace("\n", " ")[:800])
-            # Парсимо records (вбудований JSON розкладу) — головне джерело даних
-            big = ""
-            for sc in soup2.find_all("script"):
-                t = sc.string or sc.get_text() or ""
-                if "records" in t and len(t) > len(big):
-                    big = t
-            if big:
-                matches = re.findall(r"records\s*=\s*(\[.*?\])\s*;", big, re.S)
-                m = max(matches, key=len) if matches else None
-                if m:
-                    try:
-                        recs = json.loads(m)
-                        print(f"\n--- RECORDS: знайдено {len(recs)} записів ---")
-                        from collections import Counter
-                        for r in recs:
-                            d = r.get("data", [])
-                            c = dict(Counter(d))
-                            print(f"  date={r.get('date')} saved_at={r.get('saved_at')} "
-                                  f"cells={len(d)} values={c}")
-                    except Exception as e:
-                        print("records parse fail:", e)
-                # Які іконки/класи відповідають значенням
-                seen = set()
-                for mm in re.finditer(r'["\']([^"\']+\.(?:png|gif|jpg|svg))["\']', big):
-                    s = mm.group(1)
-                    if s not in seen:
-                        seen.add(s)
-                        print("IMG:", s)
-                for mm in re.finditer(r'(case\s+[\'"]\d|val\w*\s*[:=]\s*[\'"][^\'"]+|addClass\([^)]*\))', big):
-                    print("CLS:", mm.group(0)[:130])
-                for mm in re.finditer(r'.{0,100}chergi/table/img.{0,100}', big, re.S):
-                    frag = " ".join(mm.group(0).split())
-                    print("IMGCTX:", frag[:220])
-        except Exception as e:
-            print("Дамп не вдався:", e)
+        from collections import Counter
+        print(f"RECORDS: {len(records)} записів")
+        for r in records[:10]:
+            c = dict(Counter(str(v) for v in r["data"]))
+            print(f"  date={r['date']} saved_at={r.get('saved_at')} cells={len(r['data'])} values={c}")
+        rec, note = record_for(records, "today")
+        grid = build_grid(rec)
+        print(f"\nПоточний запис: {rec['date']} | черг: {len(grid)} | підчерги: {', '.join(grid)}")
+        for lbl in QUEUE_LABELS[:4]:
+            print(f"  {lbl}: {windows(grid[lbl]) or 'без відключень'}")
         return
 
     if args.digest:
-        msg = build_digest_message(args.digest, date_text, grid)
-        print(f"Діагностика: підчерг={len(grid)}, довжина={len(msg)}, дата='{date_text}'")
+        rec, note = record_for(records, "tomorrow" if args.tomorrow else "today")
+        grid = build_grid(rec) if rec else None
+        msg = build_digest_message(args.digest, rec, grid, note)
+        print(f"Дайджест: date={rec['date'] if rec else '-'}, довжина={len(msg)}")
         print(send_telegram(msg))
         return
 
-    sig = grid_signature(date_text, grid)
-    state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
+    # режим перевірки змін
+    rec, note = record_for(records, "today")
+    sig = signature(rec)
+    state = load_state()
     if state.get("signature") == sig:
-        print(f"Без змін (перевірено {len(grid)} підчерг).")
+        print(f"Без змін ({rec['date']}, перевірено {len(QUEUE_LABELS)} підчерг).")
         return
-
-    msg = build_alert_message(date_text, grid)
+    msg = build_alert_message(rec, build_grid(rec))
     if state:
-        res = send_telegram(msg)
-        print("Надіслано повідомлення про зміну:", json.dumps(res, ensure_ascii=False)[:200])
+        print(send_telegram(msg))
     else:
         print("Перший запуск: стан збережено, повідомлення не надіслано.")
-        print("\n--- Попередній перегляд повідомлення ---\n" + msg)
-
-    STATE_FILE.write_text(json.dumps({"signature": sig, "date": date_text}, ensure_ascii=False),
-                          encoding="utf-8")
+        print("\n--- Попередній перегляд ---\n" + msg)
+    save_state({"signature": sig, "date": rec["date"], "saved_at": rec.get("saved_at")})
 
 
 if __name__ == "__main__":
