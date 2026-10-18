@@ -423,10 +423,11 @@ def main():
                 if "records" in t and len(t) > len(big):
                     big = t
             if big:
-                m = re.search(r"records\s*=\s*(\[.*?\])\s*;", big, re.S)
+                matches = re.findall(r"records\s*=\s*(\[.*?\])\s*;", big, re.S)
+                m = max(matches, key=len) if matches else None
                 if m:
                     try:
-                        recs = json.loads(m.group(1))
+                        recs = json.loads(m)
                         print(f"\n--- RECORDS: знайдено {len(recs)} записів ---")
                         from collections import Counter
                         for r in recs:
@@ -445,6 +446,9 @@ def main():
                         print("IMG:", s)
                 for mm in re.finditer(r'(case\s+[\'"]\d|val\w*\s*[:=]\s*[\'"][^\'"]+|addClass\([^)]*\))', big):
                     print("CLS:", mm.group(0)[:130])
+                for mm in re.finditer(r'.{0,100}chergi/table/img.{0,100}', big, re.S):
+                    frag = " ".join(mm.group(0).split())
+                    print("IMGCTX:", frag[:220])
         except Exception as e:
             print("Дамп не вдався:", e)
         return
